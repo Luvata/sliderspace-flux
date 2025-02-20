@@ -47,7 +47,7 @@ python train_flux_sliderspace.py \
 
 This is a very short script. Training takes ~1.5 min per PCA component on an RTX 6000 Ada GPU with the above settings.
 
-**Note**: (02/20/2025) Please check [the official repository](https://github.com/rohitgandikota/sliderspace/). I've updated my implementation to address some differences. Still, some configurations may differ. If you find any differences, please feel free to open a PR.
+**Note**: (02/20/2025) The code has been updated to match the [official SliderSpace implementation](https://github.com/rohitgandikota/sliderspace/). While some configuration differences may remain, feel free to contribute improvements via PR.
 
 ### 5. Inference
 
