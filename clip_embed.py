@@ -53,9 +53,9 @@ def main():
             all_embeddings.append(embedding)
     
     all_embeddings = np.stack(all_embeddings)
+    all_embeddings = all_embeddings / np.linalg.norm(all_embeddings, axis=1, keepdims=True)
     pca = PCA()
     pca.fit(all_embeddings)
-    
     np.save(os.path.join(args.pca_output_file), pca.components_)
 
 if __name__ == "__main__":

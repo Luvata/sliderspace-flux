@@ -12,11 +12,25 @@ from diffusers.utils import convert_state_dict_to_diffusers
 from diffusers.loaders import FluxLoraLoaderMixin
 from tqdm import tqdm
 
+mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1).to("cuda")
+std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1).to("cuda")
+
+
+def latent_to_image(latents, pipe):
+    latents = pipe._unpack_latents(latents, args.train_resolution, args.train_resolution, pipe.vae_scale_factor)
+    latents = (latents / pipe.vae.config.scaling_factor) + pipe.vae.config.shift_factor
+    image = pipe.vae.decode(latents, return_dict=False)[0]
+    return image
+
+def clip_preprocess(image):
+    image = F.interpolate(image, size=(224, 224), mode="bicubic", align_corners=False)
+    image = ((image + 1.0) / 2.0).clamp(0.0, 1.0)
+    image = (image - mean) / std
+    return image
+
 
 def train(args):
     clip_model, _ = clip.load("ViT-B/32", device="cuda")
-    mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1).to("cuda")
-    std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1).to("cuda")
 
     components = np.load(args.pca_path)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -46,8 +60,7 @@ def train(args):
         vae.requires_grad_(False)
 
         transformer_lora_config = LoraConfig(
-            r=4,
-            lora_alpha=4,
+            r=1, lora_alpha=1,
             init_lora_weights="gaussian",
             target_modules=["to_k", "to_q", "to_v", "to_out.0"],
         )
@@ -58,14 +71,32 @@ def train(args):
         print(f"Component {comp_id}: Number of trainable parameters: {n_params}")
 
         optimizer = torch.optim.Adam(params_to_optimize, lr=args.learning_rate)
+        pipe.text_encoder = pipe.transformer # to bypass the dtype check ¯\_(ツ)_/¯
 
         # Training loop.
         pbar = tqdm(range(1, args.num_train_steps + 1), desc=f"Component id={comp_id}")
         for step in pbar:
+            transformer.disable_adapters()
+            base_latents = pipe(
+                guidance_scale=0,
+                num_inference_steps=1,
+                max_sequence_length=256,
+                height=args.train_resolution,
+                width=args.train_resolution,
+                num_images_per_prompt=args.train_batchsize,
+                prompt_embeds=prompt_embeds,
+                pooled_prompt_embeds=pooled_prompt_embeds,
+                output_type="latent",
+                return_dict=False,
+            )[0]
+
+            base_image = clip_preprocess(latent_to_image(base_latents, pipe))
+            base_embeds = clip_model.encode_image(base_image)
+
             optimizer.zero_grad()
-            pipe.text_encoder = pipe.transformer # to pass the dtype check ¯\_(ツ)_/¯
+            transformer.enable_adapters()
             # WARNING: Hacky bypass the @torch.no_grad() decorator in the pipeline.
-            output_latents = pipe.__call__.__wrapped__(
+            lora_latents = pipe.__call__.__wrapped__(
                 pipe,
                 guidance_scale=0,
                 num_inference_steps=1,
@@ -79,16 +110,13 @@ def train(args):
                 return_dict=False,
             )[0]
 
-            latents = pipe._unpack_latents(output_latents, args.train_resolution, args.train_resolution, pipe.vae_scale_factor)
-            latents = (latents / vae.config.scaling_factor) + vae.config.shift_factor
-            image = vae.decode(latents, return_dict=False)[0]
-            image = F.interpolate(image, size=(224, 224), mode="bicubic", align_corners=False)
-            image = ((image + 1.0) / 2.0).clamp(0.0, 1.0)
-            image = (image - mean) / std
+            lora_image = clip_preprocess(latent_to_image(lora_latents, pipe))
+            lora_embeds = clip_model.encode_image(lora_image)
 
-            clip_embeds = clip_model.encode_image(image)
+            direction = lora_embeds - base_embeds
+            direction = direction / direction.norm(dim=-1, keepdim=True)
 
-            loss = 1. - torch.nn.CosineSimilarity()(clip_embeds, component_vector).mean()
+            loss = 1. - torch.nn.CosineSimilarity(eps=1e-6)(direction, component_vector).mean()
             loss.backward()
 
             grad_norm = torch.norm(torch.stack([p.grad.norm() for p in params_to_optimize]))
@@ -103,7 +131,7 @@ def train(args):
                 FluxLoraLoaderMixin.save_lora_weights(save_dir, transformer_lora_layers=lora_layers_to_save)
 
         # Cleanup for this component.
-        del pipe, image, clip_embeds, latents, output_latents, pooled_prompt_embeds, transformer, vae
+        del pipe, lora_image, lora_embeds, base_latents, lora_latents, pooled_prompt_embeds, transformer, vae
         print(f"Finished training component {comp_id} at step {step}.")
         print("Max memory allocated (GB):", torch.cuda.max_memory_allocated() / 1e9)
         torch.cuda.empty_cache()
